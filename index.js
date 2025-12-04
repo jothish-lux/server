@@ -42,37 +42,55 @@ const PORT = process.env.PORT || 3000
 const SESSIONS_DIR = path.join(__dirname, 'sessions')
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true })
 
-// in-memory store of SESSION_ID strings (base64 of creds.json)
-const sessionResults = new Map() // sessionId -> base64 string
+// codes/<LUX~XXXX>.json will store creds.json content (our "DB")
+const CODES_DIR = path.join(__dirname, 'codes')
+if (!fs.existsSync(CODES_DIR)) fs.mkdirSync(CODES_DIR, { recursive: true })
 
-// encode creds.json as a lux-style session string
-function encodeLuxSession(credsJson) {
-  // normal base64
-  const b64 = Buffer.from(credsJson, 'utf8').toString('base64')
-  // make it URL-safe and remove padding, like many MD bots do
-  const safe = b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
-  // prefix with lux~
-  return `lux~${safe}`
+// in-memory store of sessionId -> shortCode (LUX~XXXXXX)
+const sessionResults = new Map()
+
+// track which sessions already sent the short code to WhatsApp
+const sentSessionToSelf = new Set()
+
+// generate short external code, e.g. LUX~aB3Xd91K
+function generateShortCode() {
+  return 'LUX~' + nanoid(8) // adjust length if you want
 }
 
-function buildSessionString(sessionId, sessionPath) {
+// read creds.json and store it under a short LUX~ code in codes/
+function storeSessionAndCode(sessionId, sessionPath) {
   try {
     const credsPath = path.join(sessionPath, 'creds.json')
     if (!fs.existsSync(credsPath)) {
       log.warn({ sessionId }, 'creds.json not found yet')
-      return
+      return null
     }
+
     const credsJson = fs.readFileSync(credsPath, 'utf8')
-    const sessionString = encodeLuxSession(credsJson)
-    sessionResults.set(sessionId, sessionString)
-    log.info({ sessionId }, 'SESSION_ID (lux~) built from creds.json')
+
+    // if we already generated a code for this session, reuse it
+    let shortCode = sessionResults.get(sessionId)
+    if (!shortCode) {
+      shortCode = generateShortCode()
+      sessionResults.set(sessionId, shortCode)
+    }
+
+    const codeFile = path.join(CODES_DIR, `${shortCode}.json`)
+    fs.writeFileSync(codeFile, credsJson, 'utf8')
+
+    log.info({ sessionId, shortCode }, 'Stored creds under short code (file DB)')
+    return shortCode
   } catch (err) {
-    log.error({ err, sessionId }, 'failed to build SESSION_ID')
+    log.error({ err, sessionId }, 'failed to store session code in file DB')
+    return null
   }
 }
 
 // create a Baileys socket bound to a specific sessionId (multi-file auth)
-async function createSocket(sessionId) {
+// opts.ownerJid: JID to send short code to
+// opts.mobile: true for pair login (phone), false for QR (web-style)
+async function createSocket(sessionId, opts = {}) {
+  const { ownerJid, mobile = false } = opts
   const sessionPath = path.join(SESSIONS_DIR, sessionId)
   if (!fs.existsSync(sessionPath)) fs.mkdirSync(sessionPath, { recursive: true })
 
@@ -81,22 +99,43 @@ async function createSocket(sessionId) {
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
-    browser: Browsers.macOS('Chrome')
+    browser: mobile ? Browsers.android('Chrome') : Browsers.macOS('Chrome'),
+    mobile: !!mobile
   })
 
-  // keep auth up to date & rebuild SESSION_ID string when creds change
+  // keep auth up to date & rebuild short code when creds change
   sock.ev.on('creds.update', async () => {
     await saveCreds()
-    buildSessionString(sessionId, sessionPath)
+    storeSessionAndCode(sessionId, sessionPath)
     log.info({ sessionId }, 'creds updated & saved')
   })
 
-  // also build SESSION_ID when connection first opens (for safety)
+  // when connection opens, ensure short code stored and (optionally) send to WhatsApp
   sock.ev.on('connection.update', async (update) => {
     const { connection } = update
     if (connection === 'open') {
       await saveCreds()
-      buildSessionString(sessionId, sessionPath)
+      const shortCode = storeSessionAndCode(sessionId, sessionPath)
+
+      // send ONLY the short code to WhatsApp, once
+      if (shortCode && !sentSessionToSelf.has(sessionId)) {
+        try {
+          const targetJid = ownerJid || sock.user?.id
+          if (targetJid) {
+            await sock.sendMessage(targetJid, {
+              text:
+                `✅ Your LUX session is ready.\n\n` +
+                `Short code (keep this safe):\n${shortCode}`
+            })
+            log.info({ sessionId, targetJid }, 'Sent short code to WhatsApp')
+            sentSessionToSelf.add(sessionId)
+          } else {
+            log.warn({ sessionId }, 'No target JID available to send short code')
+          }
+        } catch (err) {
+          log.error({ err, sessionId }, 'Failed to send short code to WhatsApp')
+        }
+      }
     }
   })
 
@@ -112,7 +151,8 @@ app.get('/api/session/qr', async (req, res) => {
   log.info({ sessionId }, 'QR session requested')
 
   try {
-    const sock = await createSocket(sessionId)
+    // QR login: web-style
+    const sock = await createSocket(sessionId, { mobile: false })
 
     let answered = false
 
@@ -157,7 +197,7 @@ app.get('/api/session/qr', async (req, res) => {
 
         if (statusCode === DisconnectReason.restartRequired) {
           log.warn({ sessionId }, 'restartRequired for QR, restarting socket...')
-          createSocket(sessionId).catch((err) => {
+          createSocket(sessionId, { mobile: false }).catch((err) => {
             log.error({ err, sessionId }, 'Error restarting QR socket')
           })
           return
@@ -202,7 +242,9 @@ app.get('/api/session/pair', async (req, res) => {
   log.info({ sessionId, phone }, 'Pair-code session requested')
 
   try {
-    const sock = await createSocket(sessionId)
+    // Pair login: mobile-style socket
+    const ownerJid = `${phone}@s.whatsapp.net`
+    const sock = await createSocket(sessionId, { ownerJid, mobile: true })
 
     let answered = false
     let requested = false
@@ -217,19 +259,19 @@ app.get('/api/session/pair', async (req, res) => {
     }, 60_000)
 
     sock.ev.on('connection.update', async (update) => {
-      const { connection, qr, lastDisconnect } = update
+      const { connection, lastDisconnect } = update
 
       log.info(
         {
           sessionId,
           connection,
-          hasQr: !!qr,
           statusCode: lastDisconnect?.error?.output?.statusCode
         },
         'connection.update (pair)'
       )
 
-      if (!requested && (connection === 'connecting' || !!qr)) {
+      // request pairing code once when starting / connecting
+      if (!requested && (connection === 'connecting' || connection === 'open')) {
         requested = true
         try {
           let code = await sock.requestPairingCode(phone)
@@ -269,7 +311,7 @@ app.get('/api/session/pair', async (req, res) => {
 
         if (statusCode === DisconnectReason.restartRequired) {
           log.warn({ sessionId }, 'restartRequired for pair, restarting socket...')
-          createSocket(sessionId).catch((err) => {
+          createSocket(sessionId, { ownerJid, mobile: true }).catch((err) => {
             log.error({ err, sessionId }, 'Error restarting pair socket')
           })
           return
@@ -298,16 +340,48 @@ app.get('/api/session/pair', async (req, res) => {
 /**
  * RESULT POLLING
  * GET /api/session/result/:id
+ * -> returns short LUX~XXXXXX code (if ready)
  */
 app.get('/api/session/result/:id', (req, res) => {
   const sessionId = req.params.id
-  const session = sessionResults.get(sessionId) || null
+  const code = sessionResults.get(sessionId) || null
 
   return res.json({
     sessionId,
-    ready: !!session,
-    session
+    ready: !!code,
+    code
   })
+})
+
+/**
+ * FETCH CREDS BY SHORT CODE
+ * GET /api/session/creds/:code
+ * -> returns stored creds.json for that LUX~ code
+ */
+app.get('/api/session/creds/:code', (req, res) => {
+  const code = req.params.code
+  const filePath = path.join(CODES_DIR, `${code}.json`)
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({
+      error: 'not_found',
+      message: 'No creds found for this code'
+    })
+  }
+
+  try {
+    const credsJson = fs.readFileSync(filePath, 'utf8')
+    return res.json({
+      code,
+      creds: JSON.parse(credsJson)
+    })
+  } catch (err) {
+    log.error({ err, code }, 'Error reading creds.json for code')
+    return res.status(500).json({
+      error: 'read_error',
+      details: String(err?.message || err)
+    })
+  }
 })
 
 app.listen(PORT, () => {
